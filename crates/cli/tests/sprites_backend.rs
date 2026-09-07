@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exoharness::{
-    ManagedSandboxBackend, SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess,
-    SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload,
-    SpritesConfig, SpritesSandboxBackend,
+    ManagedSandboxBackend, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess,
+    SandboxNetworkPolicy, SandboxRequest, SandboxScope, SandboxSpec, SnapshotFormat,
+    SnapshotPayload, SpritesConfig, SpritesSandboxBackend,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, path_regex};
@@ -17,10 +17,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
+        sandbox_id: sandbox_id.into(),
+        scope: Some(SandboxScope::Thread {
             thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
-        },
+        }),
         spec: SandboxSpec {
             image: "default".into(),
             resources: Default::default(),
@@ -44,7 +44,7 @@ fn sandbox_spec_hash(spec: &SandboxSpec) -> String {
 
 fn expected_sprite_name(request: &SandboxRequest) -> String {
     let mut hasher = DefaultHasher::new();
-    request.key.hash(&mut hasher);
+    request.sandbox_id.as_str().hash(&mut hasher);
     sandbox_spec_hash(&request.spec).hash(&mut hasher);
     format!("exo-{:016x}", hasher.finish())
 }
@@ -99,7 +99,7 @@ async fn acquire_creates_sprite_when_missing() {
         .await;
 
     let handle = backend.acquire(request).await.expect("acquire");
-    assert_eq!(handle.id(), "sprites:thread:conv-1:sandbox-1");
+    assert_eq!(handle.id(), "sprites:sandbox-1");
 }
 
 #[tokio::test]
@@ -134,9 +134,11 @@ async fn acquire_create_includes_exo_metadata_labels() {
         .get("labels")
         .and_then(Value::as_array)
         .expect("labels array");
-    assert!(labels.iter().any(|label| {
-        label.as_str() == Some("exo.sandbox.key=thread:conv-labels:sandbox-labels")
-    }));
+    assert!(
+        labels
+            .iter()
+            .any(|label| { label.as_str() == Some("exo.sandbox.key=sandbox-labels") })
+    );
     assert!(
         labels
             .iter()
@@ -241,7 +243,7 @@ async fn acquire_reuses_existing_sprite_without_create() {
         .acquire(request)
         .await
         .expect("acquire should reuse existing sprite");
-    assert_eq!(handle.id(), "sprites:thread:conv-3:sandbox-3");
+    assert_eq!(handle.id(), "sprites:sandbox-3");
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(

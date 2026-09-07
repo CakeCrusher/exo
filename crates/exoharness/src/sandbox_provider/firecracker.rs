@@ -44,12 +44,12 @@ use uuid::Uuid;
 
 use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxCommandOutput, SandboxKey, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
-    SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    SandboxCommandOutput, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
+    SnapshotPayload, sandbox_spec_hash,
 };
 use crate::sandbox_provider::process_bridge;
 use crate::{
-    FileSystemMountMode, SandboxAttachment, SandboxProcessParts, SandboxResourceShape,
+    FileSystemMountMode, SandboxAttachment, SandboxId, SandboxProcessParts, SandboxResourceShape,
     SandboxTerminalParts, SandboxTerminalSize,
 };
 
@@ -499,14 +499,14 @@ impl MachineLifecycleLocks {
         self.lock_key(machine_lifecycle_key(machine_id)).await
     }
 
-    async fn lock_sandbox(&self, key: &SandboxKey) -> OwnedMutexGuard<()> {
-        self.lock_key(sandbox_lifecycle_key(key)).await
+    async fn lock_sandbox(&self, sandbox_id: &str) -> OwnedMutexGuard<()> {
+        self.lock_key(sandbox_lifecycle_key(sandbox_id)).await
     }
 
     async fn lock_sandbox_pair(
         &self,
-        first: &SandboxKey,
-        second: &SandboxKey,
+        first: &str,
+        second: &str,
     ) -> (OwnedMutexGuard<()>, Option<OwnedMutexGuard<()>>) {
         let first = sandbox_lifecycle_key(first);
         let second = sandbox_lifecycle_key(second);
@@ -577,7 +577,7 @@ struct Shared {
     // matching machines after the prior controller releases this lock; the
     // lock prevents concurrent controllers from racing that reconciliation.
     _state_lock: File,
-    warm_machines: Mutex<HashMap<SandboxKey, WarmMachineEntry>>,
+    warm_machines: Mutex<HashMap<SandboxId, WarmMachineEntry>>,
     lifecycle_locks: MachineLifecycleLocks,
     capacity_gate: Mutex<()>,
     starting_machines: Arc<StdMutex<HashSet<String>>>,
@@ -796,6 +796,7 @@ impl FirecrackerSandboxBackend {
 
     // The caller holds the source machine's lifecycle lock until capture has
     // resumed the VM and published the immutable template.
+    #[tracing::instrument(name = "firecracker.snapshot_capture", skip_all)]
     async fn capture_snapshot_locked(
         shared: &Arc<Shared>,
         request: &SandboxRequest,
@@ -840,7 +841,9 @@ impl FirecrackerSandboxBackend {
         let config = shared.config.clone();
         let source_for_snapshot = source.clone();
         let key_for_snapshot = template_key.clone();
+        let span = tracing::Span::current();
         let lease = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             capture_snapshot_template(&config, &source_for_snapshot, &key_for_snapshot, lifecycle)
         })
         .await
@@ -866,8 +869,12 @@ impl FirecrackerSandboxBackend {
         captured_lease: Option<File>,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let spec_hash = sandbox_spec_hash(&request.spec);
-        let machine_id = machine_id(&request.key, &spec_hash);
-        let _lifecycle_guard = self.shared.lifecycle_locks.lock_sandbox(&request.key).await;
+        let machine_id = machine_id(request.sandbox_id.as_str(), &spec_hash);
+        let _lifecycle_guard = self
+            .shared
+            .lifecycle_locks
+            .lock_sandbox(request.sandbox_id.as_str())
+            .await;
         self.restore_snapshot_locked(
             request,
             manifest,
@@ -1001,11 +1008,15 @@ impl FirecrackerSandboxBackend {
         let one_shot = request.lifecycle.idle_ttl.is_none();
         let machine_id = if one_shot {
             let sequence = ONE_SHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            one_shot_machine_id(&request.key, &spec_hash, sequence)
+            one_shot_machine_id(request.sandbox_id.as_str(), &spec_hash, sequence)
         } else {
-            machine_id(&request.key, &spec_hash)
+            machine_id(request.sandbox_id.as_str(), &spec_hash)
         };
-        let _lifecycle_guard = self.shared.lifecycle_locks.lock_sandbox(&request.key).await;
+        let _lifecycle_guard = self
+            .shared
+            .lifecycle_locks
+            .lock_sandbox(request.sandbox_id.as_str())
+            .await;
         self.acquire_resolved_locked(request, spec_hash, machine_id, one_shot, None)
             .await
     }
@@ -1021,8 +1032,8 @@ impl FirecrackerSandboxBackend {
         one_shot: bool,
         capacity_reservation: Option<MachineCapacityReservation>,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        let stable_machine_id = machine_id(&request.key, &spec_hash);
-        let machine_key_prefix = format!("fc-{}-", stable_id(&request.key.to_string()));
+        let stable_machine_id = machine_id(request.sandbox_id.as_str(), &spec_hash);
+        let machine_key_prefix = format!("fc-{}-", stable_id(request.sandbox_id.as_str()));
 
         if let Some(state) = request
             .provider_state
@@ -1042,9 +1053,9 @@ impl FirecrackerSandboxBackend {
         if !one_shot {
             let replaced = {
                 let mut machines = self.shared.warm_machines.lock().await;
-                match machines.get(&request.key) {
+                match machines.get(request.sandbox_id.as_str()) {
                     Some(entry) if entry.spec_hash == spec_hash => None,
-                    Some(_) => machines.remove(&request.key),
+                    Some(_) => machines.remove(request.sandbox_id.as_str()),
                     None => None,
                 }
             };
@@ -1068,7 +1079,7 @@ impl FirecrackerSandboxBackend {
         if !one_shot {
             self.shared.touch_machine_lease(&target_machine_id).await?;
             self.shared.warm_machines.lock().await.insert(
-                request.key.clone(),
+                request.sandbox_id.clone(),
                 WarmMachineEntry {
                     machine_id: target_machine_id.clone(),
                     spec_hash: spec_hash.clone(),
@@ -1104,6 +1115,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
+    #[tracing::instrument(name = "firecracker.acquire", skip_all)]
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
@@ -1124,6 +1136,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         self.shared.delete_snapshot(payload).await
     }
 
+    #[tracing::instrument(name = "firecracker.terminate", skip_all)]
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
         let persisted_machine_id = request
             .provider_state
@@ -1132,23 +1145,27 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             .transpose()?
             .map(|state| state.machine_id);
         if let Some(machine_id) = persisted_machine_id.as_deref() {
-            let machine_key_prefix = format!("fc-{}-", stable_id(&request.key.to_string()));
+            let machine_key_prefix = format!("fc-{}-", stable_id(request.sandbox_id.as_str()));
             if !valid_machine_id(machine_id) || !machine_id.starts_with(&machine_key_prefix) {
                 bail!("Firecracker provider state does not match the terminated sandbox key");
             }
         }
-        let _lifecycle_guard = self.shared.lifecycle_locks.lock_sandbox(&request.key).await;
+        let _lifecycle_guard = self
+            .shared
+            .lifecycle_locks
+            .lock_sandbox(request.sandbox_id.as_str())
+            .await;
         let machine_id = self
             .shared
             .warm_machines
             .lock()
             .await
-            .remove(&request.key)
+            .remove(request.sandbox_id.as_str())
             .map(|entry| entry.machine_id)
             .or(persisted_machine_id)
             .unwrap_or_else(|| {
                 let spec_hash = sandbox_spec_hash(&request.spec);
-                machine_id(&request.key, &spec_hash)
+                machine_id(request.sandbox_id.as_str(), &spec_hash)
             });
         self.shared.cleanup_machine(&machine_id, true).await
     }
@@ -1160,22 +1177,22 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let mut source = prepare_request(source)?;
         let target = self.resolve_request(target).await?;
-        if source.key == target.key {
+        if source.sandbox_id == target.sandbox_id {
             bail!("Firecracker fork source and target must be different sandboxes")
         }
         let target_spec_hash = sandbox_spec_hash(&target.spec);
-        let target_machine_id = machine_id(&target.key, &target_spec_hash);
+        let target_machine_id = machine_id(&target.sandbox_id, &target_spec_hash);
         let (_first_lifecycle_guard, _second_lifecycle_guard) = self
             .shared
             .lifecycle_locks
-            .lock_sandbox_pair(&source.key, &target.key)
+            .lock_sandbox_pair(&source.sandbox_id, &target.sandbox_id)
             .await;
         let source_entry = self
             .shared
             .warm_machines
             .lock()
             .await
-            .get(&source.key)
+            .get(&source.sandbox_id)
             .cloned()
             .context("Firecracker fork source is not active")?;
         let source_record = self
@@ -1212,6 +1229,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         .await
     }
 
+    #[tracing::instrument(name = "firecracker.restore", skip_all)]
     async fn acquire_from_snapshot(
         &self,
         request: SandboxRequest,
@@ -1258,6 +1276,13 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         Some(self.request.spec.image.clone())
     }
 
+    async fn is_running(&self) -> Result<Option<bool>> {
+        let pid_path = self.shared.pid_path(&self.machine.record.machine_id);
+        tokio::task::spawn_blocking(move || observe_machine_process(&pid_path))
+            .await
+            .context("joining Firecracker liveness observation")?
+    }
+
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
         let output = GuestClient::new(Arc::clone(&self.shared), self.machine.vsock_path.clone())
             .exec(&self.request.spec, command)
@@ -1286,7 +1311,7 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             touch_machine(
                 &self.shared,
                 &self.shared.warm_machines,
-                &self.request.key,
+                self.request.sandbox_id.as_str(),
                 &self.machine.record.machine_id,
             )
             .await?;
@@ -1310,7 +1335,7 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             touch_machine(
                 &self.shared,
                 &self.shared.warm_machines,
-                &self.request.key,
+                self.request.sandbox_id.as_str(),
                 &self.machine.record.machine_id,
             )
             .await?;
@@ -1338,7 +1363,7 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
             touch_machine(
                 &self.shared,
                 &self.shared.warm_machines,
-                &self.request.key,
+                self.request.sandbox_id.as_str(),
                 &self.machine.record.machine_id,
             )
             .await?;
@@ -1350,6 +1375,7 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         true
     }
 
+    #[tracing::instrument(name = "firecracker.connect_tcp", skip_all)]
     async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
         if !self.machine.record.network_enabled {
             bail!("Firecracker sandbox does not have networking enabled");
@@ -1358,6 +1384,7 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         Ok(Some(Box::pin(TcpStream::connect(address).await?)))
     }
 
+    #[tracing::instrument(name = "firecracker.stop", skip_all)]
     async fn stop(&self) -> Result<()> {
         let _lifecycle_guard = self
             .shared
@@ -1466,6 +1493,7 @@ impl Shared {
         }
     }
 
+    #[tracing::instrument(name = "firecracker.capacity", skip_all)]
     async fn reserve_machine_capacity(
         &self,
         machine_id: &str,
@@ -1523,6 +1551,7 @@ impl Shared {
         Ok(())
     }
 
+    #[tracing::instrument(name = "firecracker.ensure_machine", skip_all)]
     async fn ensure_machine(
         self: &Arc<Self>,
         request: &SandboxRequest,
@@ -1604,6 +1633,7 @@ impl Shared {
         Ok(machine)
     }
 
+    #[tracing::instrument(name = "firecracker.restore_network", skip_all)]
     async fn reconfigure_restored_network(self: &Arc<Self>, machine: &Machine) -> Result<()> {
         // Snapshot memory contains the source guest's configured IP, while each
         // clone gets a distinct host TAP/resource slot. Reset the address before
@@ -1640,6 +1670,7 @@ impl Shared {
             .context("joining Firecracker lease update")?
     }
 
+    #[tracing::instrument(name = "firecracker.allocate_machine", skip_all)]
     async fn new_machine_record(
         &self,
         request: &SandboxRequest,
@@ -1657,7 +1688,13 @@ impl Shared {
                 .spec
                 .durable_file_systems
                 .first()
-                .map(|file_system| stable_id(&format!("{}\n{}", request.key, file_system.name)))
+                .map(|file_system| {
+                    stable_id(&format!(
+                        "{}\n{}",
+                        request.sandbox_id.as_str(),
+                        file_system.name
+                    ))
+                })
         } else {
             None
         };
@@ -1707,6 +1744,7 @@ impl Shared {
         .context("joining Firecracker machine allocation")?
     }
 
+    #[tracing::instrument(name = "firecracker.prepare_launch", skip_all)]
     async fn prepare_and_launch(
         &self,
         request: &SandboxRequest,
@@ -1715,7 +1753,9 @@ impl Shared {
         let config = self.config.clone();
         let request = request.clone();
         let record = record.clone();
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let network = record.network();
             let result = (|| {
                 if record.network_enabled {
@@ -1737,6 +1777,7 @@ impl Shared {
         .context("joining Firecracker launch task")?
     }
 
+    #[tracing::instrument(name = "firecracker.stop_process", skip_all)]
     async fn stop_machine_process(&self, machine_id: &str) -> Result<()> {
         let pid_path = self.pid_path(machine_id);
         let machine_id = machine_id.to_string();
@@ -1745,6 +1786,7 @@ impl Shared {
             .context("joining Firecracker stop task")?
     }
 
+    #[tracing::instrument(name = "firecracker.cleanup_network", skip_all)]
     async fn cleanup_network(&self, network: &NetworkConfig) {
         let network = network.clone();
         if let Err(error) =
@@ -1754,6 +1796,7 @@ impl Shared {
         }
     }
 
+    #[tracing::instrument(name = "firecracker.cleanup", skip_all)]
     async fn cleanup_machine(&self, machine_id: &str, delete_rootfs: bool) -> Result<()> {
         if !valid_machine_id(machine_id) {
             bail!("invalid Firecracker machine id: {machine_id}");
@@ -2187,6 +2230,7 @@ pub(super) fn copy_sparse_full(source: &Path, destination: &Path) -> Result<()> 
     copy_sparse_with_mode(source, destination, SparseCopyMode::Full)
 }
 
+#[tracing::instrument(name = "firecracker.copy_snapshot_file", skip_all)]
 fn copy_sparse_reflink(source: &Path, destination: &Path) -> Result<()> {
     copy_sparse_with_mode(source, destination, SparseCopyMode::ReflinkRequired)
 }
@@ -2212,20 +2256,20 @@ fn binary_version(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("could not parse version from {}", path.display()))
 }
 
-fn machine_id(key: &SandboxKey, spec_hash: &str) -> String {
-    format!("fc-{}-{}", stable_id(&key.to_string()), &spec_hash[..8])
+fn machine_id(sandbox_id: &str, spec_hash: &str) -> String {
+    format!("fc-{}-{}", stable_id(sandbox_id), &spec_hash[..8])
 }
 
-fn one_shot_machine_id(key: &SandboxKey, spec_hash: &str, sequence: u64) -> String {
+fn one_shot_machine_id(sandbox_id: &str, spec_hash: &str, sequence: u64) -> String {
     format!(
         "fc-{}-{}",
-        stable_id(&format!("{key}\n{}\n{sequence}", std::process::id())),
+        stable_id(&format!("{sandbox_id}\n{}\n{sequence}", std::process::id())),
         &spec_hash[..8]
     )
 }
 
-fn sandbox_lifecycle_key(key: &SandboxKey) -> String {
-    format!("fc-{}", stable_id(&key.to_string()))
+fn sandbox_lifecycle_key(sandbox_id: &str) -> String {
+    format!("fc-{}", stable_id(sandbox_id))
 }
 
 fn machine_lifecycle_key(machine_id: &str) -> String {
@@ -2624,6 +2668,7 @@ fn ipv4_add(address: Ipv4Addr, offset: u32) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(address) + offset)
 }
 
+#[tracing::instrument(name = "firecracker.network_setup", skip_all)]
 fn prepare_network(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
@@ -3049,6 +3094,7 @@ fn remove_firecracker_cgroup(path: &Path) -> Result<()> {
     }
 }
 
+#[tracing::instrument(name = "firecracker.prepare_vm", skip_all)]
 fn prepare_and_launch_blocking(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
@@ -3165,6 +3211,7 @@ fn prepare_and_launch_blocking(
     Ok(GuestReadiness::Signal(ready_listener))
 }
 
+#[tracing::instrument(name = "firecracker.launch_vmm", skip_all)]
 fn spawn_jailed_firecracker(
     config: &FirecrackerConfig,
     record: &MachineRecord,
@@ -3524,6 +3571,7 @@ fn replace_hard_link(source: &Path, destination: &Path) -> Result<()> {
     })
 }
 
+#[tracing::instrument(name = "firecracker.prepare_snapshot_files", skip_all)]
 fn prepare_snapshot_jail_files(
     config: &FirecrackerConfig,
     request: &SandboxRequest,
@@ -3596,6 +3644,7 @@ fn firecracker_api_patch<T: Serialize>(socket: &Path, path: &str, body: &T) -> R
     firecracker_api_request(socket, "PATCH", path, body, FIRECRACKER_API_TIMEOUT)
 }
 
+#[tracing::instrument(name = "firecracker.api", skip_all, fields(method, path))]
 fn firecracker_api_request<T: Serialize>(
     socket: &Path,
     method: &str,
@@ -3771,6 +3820,7 @@ fn enforce_snapshot_budget(config: &FirecrackerConfig, capture_bytes: u64) -> Re
     Ok(())
 }
 
+#[tracing::instrument(name = "firecracker.capture_template", skip_all)]
 fn capture_snapshot_template(
     config: &FirecrackerConfig,
     source: &MachineRecord,
@@ -3926,6 +3976,7 @@ fn capture_snapshot_template(
     open_snapshot_template_lease(config, template_key)
 }
 
+#[tracing::instrument(name = "firecracker.prepare_snapshot_overlay", skip_all)]
 fn prepare_snapshot_overlay(
     config: &FirecrackerConfig,
     record: &MachineRecord,
@@ -4020,6 +4071,28 @@ fn process_running(pid_path: &Path) -> bool {
         return false;
     };
     PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+#[cfg(target_os = "linux")]
+fn observe_machine_process(pid_path: &Path) -> Result<Option<bool>> {
+    let pid = match fs::read_to_string(pid_path) {
+        Ok(pid) => pid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(false)),
+        Err(error) => return Err(error).context("reading Firecracker pid"),
+    };
+    let pid = Pid::from_raw(pid.trim().parse().context("invalid Firecracker pid")?)
+        .context("invalid Firecracker pid")?;
+    let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(rustix::io::Errno::SRCH) => return Ok(Some(false)),
+        Err(error) => return Err(error).context("opening Firecracker pidfd"),
+    };
+    Ok(Some(!wait_for_pidfd(&pidfd, Duration::ZERO)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observe_machine_process(_pid_path: &Path) -> Result<Option<bool>> {
+    Ok(None)
 }
 
 #[cfg(target_os = "linux")]
@@ -4517,6 +4590,7 @@ impl Drop for ProcessWait {
     }
 }
 
+#[tracing::instrument(name = "firecracker.guest_ready", skip_all)]
 async fn wait_for_guest(
     shared: &Shared,
     machine_id: &str,
@@ -4529,6 +4603,7 @@ async fn wait_for_guest(
         .context("joining Firecracker guest-ready wait")?
 }
 
+#[tracing::instrument(name = "firecracker.restored_guest_ready", skip_all)]
 async fn wait_for_restored_guest(shared: &Arc<Shared>, machine: &Machine) -> Result<()> {
     let started = Instant::now();
     let pid_path = shared.pid_path(&machine.record.machine_id);
@@ -4610,13 +4685,13 @@ fn wait_for_guest_blocking(
 
 async fn touch_machine(
     shared: &Shared,
-    machines: &Mutex<HashMap<SandboxKey, WarmMachineEntry>>,
-    key: &SandboxKey,
+    machines: &Mutex<HashMap<SandboxId, WarmMachineEntry>>,
+    sandbox_id: &str,
     machine_id: &str,
 ) -> Result<()> {
     let touched = {
         let mut machines = machines.lock().await;
-        if let Some(entry) = machines.get_mut(key)
+        if let Some(entry) = machines.get_mut(sandbox_id)
             && entry.machine_id == machine_id
         {
             entry.last_used_at = Instant::now();
