@@ -250,12 +250,42 @@ impl<T> SandboxTcpStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncW
 
 pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SandboxImageConfiguration {
+    pub entrypoint: Option<Vec<String>>,
+    pub cmd: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub working_dir: Option<String>,
+    pub healthcheck: Option<SandboxImageHealthcheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SandboxImageHealthcheck {
+    pub test: Vec<String>,
+    pub interval: Option<u64>,
+    pub timeout: Option<u64>,
+    pub start_period: Option<u64>,
+    pub retries: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedSandboxImage {
+    pub image: String,
+    pub configuration: SandboxImageConfiguration,
+}
+
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
     fn is_local(&self) -> bool;
 
     /// Formats this backend can consume in `acquire_from_snapshot`.
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat];
+
+    async fn resolve_image(&self, _image: &str) -> Result<ResolvedSandboxImage> {
+        bail!("sandbox backend does not expose image configuration")
+    }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>>;
     async fn attach(

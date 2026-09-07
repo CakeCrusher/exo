@@ -1115,6 +1115,27 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
         &CONSUMABLE_SNAPSHOT_FORMATS
     }
 
+    async fn resolve_image(&self, image: &str) -> Result<crate::ResolvedSandboxImage> {
+        let path = resolve_image(
+            &self.shared.config.state_root,
+            image,
+            self.shared.config.image_size_gib,
+            &self.shared.config.allowed_local_images,
+            &self.shared.config.allowed_registries,
+        )
+        .await?;
+        tokio::task::spawn_blocking(move || {
+            let file = File::open(path.with_extension("config.json"))?;
+            let configuration = serde_json::from_reader(std::io::Read::take(file, 65_536))?;
+            Ok(crate::ResolvedSandboxImage {
+                image: path.to_string_lossy().into_owned(),
+                configuration,
+            })
+        })
+        .await
+        .context("joining Firecracker image configuration read")?
+    }
+
     #[tracing::instrument(name = "firecracker.acquire", skip_all)]
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
         self.reap_stale_machines().await?;
