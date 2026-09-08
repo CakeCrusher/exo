@@ -3402,7 +3402,7 @@ fn firecracker_vm_configuration(
             vcpu_count: record.runtime.vcpu_count,
             mem_size_mib: record.runtime.memory_mib,
             smt: false,
-            track_dirty_pages: false,
+            track_dirty_pages: true,
         },
         network_interfaces,
         vsock: FirecrackerVsock {
@@ -3831,7 +3831,22 @@ fn snapshot_directory_bytes(directory: &Path) -> Result<u64> {
 }
 
 fn enforce_snapshot_budget(config: &FirecrackerConfig, capture_bytes: u64) -> Result<()> {
-    let retained = snapshot_directory_bytes(&config.state_root.join("snapshots"))?;
+    let mut retained = snapshot_directory_bytes(&config.state_root.join("snapshots"))?;
+    let machines = match fs::read_dir(jail_dir(config, "")) {
+        Ok(machines) => Some(machines),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("reading Firecracker snapshot memory bases"),
+    };
+    for machine in machines.into_iter().flatten() {
+        let memory = match fs::metadata(machine?.path().join("snapshot-memory")) {
+            Ok(memory) => memory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("reading Firecracker snapshot memory base"),
+        };
+        retained = retained
+            .checked_add(memory.len())
+            .context("snapshot size overflow")?;
+    }
     if retained
         .checked_add(capture_bytes)
         .is_none_or(|total| total > MAX_SNAPSHOT_BYTES)
@@ -3848,6 +3863,20 @@ fn capture_snapshot_template(
     template_key: &str,
     lifecycle: SnapshotTemplateLifecycle,
 ) -> Result<File> {
+    let capture_pending = jail_dir(config, &source.machine_id).join("snapshot-pending");
+    let memory_base = jail_dir(config, &source.machine_id).join("snapshot-memory");
+    if capture_pending.try_exists()? {
+        bail!(
+            "a previous Firecracker capture did not complete; restart the sandbox before snapshotting again"
+        );
+    }
+    if fs::read_to_string("/proc/swaps")?
+        .lines()
+        .skip(1)
+        .any(|line| !line.trim().is_empty())
+    {
+        bail!("sparse Firecracker snapshots require host swap to be disabled");
+    }
     let capture_lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3905,21 +3934,65 @@ fn capture_snapshot_template(
     let snapshot_path = format!("/{output_name}/state");
     let memory_path = format!("/{output_name}/memory");
     let paused_result = (|| {
-        // A snapshot captures a full point-in-time device/RAM image once. Clones
-        // map the immutable memory file privately and get independent COW disks.
+        let base = if memory_base.try_exists()? {
+            Some(memory_base.clone())
+        } else {
+            source
+                .snapshot_template
+                .as_ref()
+                .map(|base| snapshot_template_dir(config, &base.key).map(|dir| dir.join("memory")))
+                .transpose()?
+        };
+        if let Some(base) = base {
+            let memory = temporary.join("memory-seed");
+            copy_sparse_reflink(&base, &memory)?;
+            chown(&memory, Some(uid), Some(uid))?;
+            fs::set_permissions(&memory, Permissions::from_mode(0o600))?;
+            let output_dir = rustix::fs::open(
+                &output,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            rustix::fs::linkat(
+                rustix::fs::CWD,
+                &memory,
+                &output_dir,
+                "memory",
+                rustix::fs::AtFlags::empty(),
+            )?;
+            fs::remove_file(&memory)?;
+        }
+        // A fresh VM's first sparse snapshot is complete on its own. Subsequent
+        // captures apply dirty pages over a private reflink of the latest memory.
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#full-and-diff-snapshots
         // https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md#memory-backend
-        firecracker_api_request(
-            &api,
-            "PUT",
-            "/snapshot/create",
-            &FirecrackerSnapshotCreate {
-                snapshot_type: "Full",
-                snapshot_path: &snapshot_path,
-                mem_file_path: &memory_path,
-            },
-            FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT,
-        )?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&capture_pending)?
+            .sync_all()?;
+        tracing::info_span!("firecracker.snapshot_memory").in_scope(|| {
+            firecracker_api_request(
+                &api,
+                "PUT",
+                "/snapshot/create",
+                &FirecrackerSnapshotCreate {
+                    snapshot_type: "Diff",
+                    snapshot_path: &snapshot_path,
+                    mem_file_path: &memory_path,
+                },
+                FIRECRACKER_SNAPSHOT_CREATE_TIMEOUT,
+            )
+        })?;
+        let memory = fs::metadata(output.join("memory"))?;
+        tracing::info!(
+            memory_bytes = memory.len(),
+            allocated_bytes = memory.blocks() * 512,
+            "captured Firecracker snapshot memory"
+        );
         // Only the disk copy must happen inside the pause window: the overlay
         // has to match the memory image byte-for-byte, and the source starts
         // writing to it again the moment it resumes.
@@ -3994,6 +4067,8 @@ fn capture_snapshot_template(
     fs::rename(&temporary, &destination)
         .with_context(|| format!("publishing Firecracker snapshot {}", destination.display()))?;
     validate_snapshot_template(config, &destination, source.runtime.memory_mib)?;
+    replace_hard_link(&destination.join("memory"), &memory_base)?;
+    fs::remove_file(&capture_pending)?;
     open_snapshot_template_lease(config, template_key)
 }
 
@@ -4055,7 +4130,7 @@ fn launch_snapshot_clone(
                 backend_path: "/snapshot/memory",
                 backend_type: "File",
             },
-            track_dirty_pages: false,
+            track_dirty_pages: true,
             resume_vm: true,
         },
         FIRECRACKER_API_TIMEOUT,

@@ -138,6 +138,20 @@ use forks, the guest kernel must additionally be 5.18 or newer with
 `CONFIG_HW_RANDOM_VIRTIO=y` lets the guest draw extra entropy from the
 attached virtio-rng device.
 
+Exo enables dirty-page tracking and captures sparse memory snapshots instead
+of writing the entire configured RAM size. Each capture merges changes into a
+private reflink of the machine's latest captured memory, or its original restore
+template on the first capture. The result is independently restorable. Published
+templates remain read-only and shared by restored VMs; disk and memory are
+captured while the guest is paused.
+
+The latest memory base is retained outside the writable jail, counted against
+the snapshot budget, and removed with the machine. An interrupted capture blocks
+further snapshots until that sandbox is restarted: Firecracker may already have
+cleared dirty bits, so repeating a diff against the previous base would be unsafe.
+Host swap must remain disabled, including when adopting a VM started without
+dirty-page tracking by an older backend.
+
 Install matching official Firecracker and jailer release binaries under
 `/usr/local/bin`, and install the guest kernel at
 `/var/lib/exo/firecracker/vmlinux`. The binaries and all parent directories
