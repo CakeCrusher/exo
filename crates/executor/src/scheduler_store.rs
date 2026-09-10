@@ -26,7 +26,7 @@ impl SchedulerStore {
 
     pub async fn create_task(&self, request: NewScheduledTask) -> Result<ScheduledTaskRecord> {
         let task = ScheduledTaskRecord::new(request, now_ms())?;
-        self.write_task(&task, Write::Create).await?;
+        self.write_task(&task, Write::CreateOrReplace).await?;
         Ok(task)
     }
 
@@ -114,15 +114,15 @@ impl SchedulerStore {
         }
     }
 
-    /// Updates an existing task record.
+    /// Replaces an existing task record, and does nothing if the task is gone.
     ///
     /// A fire runs a model turn, so a task can be deleted while a run holds a
-    /// copy of its record. Writing that copy back must not recreate the task,
-    /// so this replaces an existing record and is a no-op once the task is
-    /// gone. The check and the write happen under the tasks lock, so a delete
-    /// cannot land between them. Use `create_task` to add a task.
+    /// copy of its record. Writing that copy back must not bring the task
+    /// back, so this never creates the file. The existence check and the write
+    /// happen under the tasks lock, so a delete cannot land between them. Use
+    /// `create_task` to add a task.
     pub async fn put_task(&self, task: &ScheduledTaskRecord) -> Result<()> {
-        self.write_task(task, Write::Replace).await
+        self.write_task(task, Write::ReplaceIfExists).await
     }
 
     async fn write_task(&self, task: &ScheduledTaskRecord, mode: Write) -> Result<()> {
@@ -132,7 +132,7 @@ impl SchedulerStore {
         let bytes = serde_json::to_vec_pretty(task)?;
         tokio::task::spawn_blocking(move || -> Result<()> {
             let _lock = TasksLock::acquire(&root)?;
-            if mode == Write::Replace && !path.exists() {
+            if mode == Write::ReplaceIfExists && !path.exists() {
                 return Ok(());
             }
             write_json_file_blocking(&path, &bytes)
@@ -307,11 +307,14 @@ fn write_json_file_blocking(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
-/// Whether a task file may be created, or only replaced if it still exists.
+/// Whether a task file write may bring the record into existence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Write {
-    Create,
-    Replace,
+    /// Write unconditionally: the record is created, and a file already at
+    /// that path is overwritten.
+    CreateOrReplace,
+    /// Write only if the file is still there; a no-op once it is gone.
+    ReplaceIfExists,
 }
 
 /// Serializes task-file writes against deletes across processes: the runner,
